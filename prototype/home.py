@@ -135,29 +135,58 @@ Look up the target values for hour {hour} in the winter schedule.
 If any set-point differs from the target, call curl to POST the correct value NOW.
 Do not explain first — just make the curl calls, then summarize what you did."""
 
-            # ── 3. Run agent (expecting POSTs only) ─────────────────────
+            # ── 3. Run agent with continuation loop ───────────────────
+            # Some models only make one tool call per turn, so we loop until
+            # either: (a) no tool calls made, or (b) max rounds reached.
             start_time = time.time()
-            final_message = None
-            for event in agent.stream(
-                {"messages": [HumanMessage(content=user_msg)]},
-                stream_mode="updates",
-            ):
-                for node_name, node_output in event.items():
-                    if "messages" in node_output:
-                        for msg in node_output["messages"]:
-                            print(f"  [{node_name}] {msg.type}: {msg.content[:300] if msg.content else '(tool call)'}")
-                            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                                for tc in msg.tool_calls:
-                                    print(f"    -> tool_call: {tc['name']}({tc['args']})")
-                            final_message = msg
+            messages = [HumanMessage(content=user_msg)]
+            max_rounds = 5
+            total_tool_calls = 0
+
+            for round_num in range(1, max_rounds + 1):
+                print(f"\n  --- Round {round_num} ---")
+                
+                # Run the agent graph
+                result = agent.invoke({"messages": messages})
+                
+                # Extract messages from result
+                result_messages = result.get("messages", [])
+                round_tool_calls = 0
+                final_content = ""
+                
+                # Process and display each message
+                for msg in result_messages:
+                    # Skip the initial human message we sent
+                    if msg.type == "human" and msg.content == user_msg:
+                        continue
+                    
+                    content_preview = msg.content[:300] if msg.content else "(no content)"
+                    print(f"  [{msg.type}] {content_preview}")
+                    
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            print(f"    -> tool_call: {tc['name']}({tc['args']})")
+                            round_tool_calls += 1
+                    
+                    # Track the final AI message content
+                    if msg.type == "ai" and msg.content:
+                        final_content = msg.content
+                
+                total_tool_calls += round_tool_calls
+                
+                # If no tool calls this round, the agent is done
+                if round_tool_calls == 0:
+                    print(f"  (no tool calls — done)")
+                    break
+                
+                # Otherwise, continue the conversation
+                # Update messages to be the full history, then add a follow-up
+                messages = result_messages + [
+                    HumanMessage(content="Continue. If there are more set-points that need changing, call curl for each one now. If all set-points are now correct, say 'All done.'")
+                ]
 
             elapsed = time.time() - start_time
-
-            print(f"\n  AGENT ANSWER:")
-            if final_message and final_message.content:
-                for line in final_message.content.strip().splitlines():
-                    print(f"    {line}")
-            print(f"  ({elapsed:.2f}s)")
+            print(f"\n  SUMMARY: {total_tool_calls} tool call(s) across {round_num} round(s) ({elapsed:.2f}s)")
 
             time.sleep(LOOP_DELAY)
 
