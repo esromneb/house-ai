@@ -1,11 +1,48 @@
 """Mock web server for smart home control (thermostat + water heater).
 
 Stores all state in RAM. Prints every request to stdout for debugging.
-Run with:  python prototype/mock_server.py
+
+Time modes:
+  --real-time    use the actual system clock (default)
+  --fake-time    simulate 1 hour passing per real minute (starts at midnight)
+
+Run with:
+  python prototype/mock_server.py
+  python prototype/mock_server.py --fake-time
 """
 
+import argparse
+import datetime
+import time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+
+
+# ── Time helpers ─────────────────────────────────────────────────────────────
+
+class RealClock:
+    """Returns the actual system time."""
+    def now(self) -> datetime.datetime:
+        return datetime.datetime.now()
+
+
+class FakeClock:
+    """Simulates time passing at 60× speed (1 real minute = 1 fake hour).
+    Starts at midnight of the current date."""
+    SPEED = 60  # 60× → 1 real minute = 1 simulated hour
+
+    def __init__(self):
+        self._real_start = _time.monotonic()
+        today = datetime.date.today()
+        self._fake_start = datetime.datetime(today.year, today.month, today.day, 0, 0, 0)
+
+    def now(self) -> datetime.datetime:
+        elapsed_real = _time.monotonic() - self._real_start
+        elapsed_fake = datetime.timedelta(seconds=elapsed_real * self.SPEED)
+        return self._fake_start + elapsed_fake
+
+
+clock: "RealClock | FakeClock" = RealClock()  # replaced in __main__ if --fake-time
 
 # ── In-memory state ──────────────────────────────────────────────────────────
 
@@ -75,6 +112,17 @@ class SmartHomeHandler(BaseHTTPRequestHandler):
         elif path == "/water_heater":
             self._send_json(state["water_heater"])
 
+        # --- time -----------------------------------------------------------
+        elif path == "/time":
+            now = clock.now()
+            self._send_json({
+                "datetime": now.isoformat(),
+                "hour": now.hour,
+                "minute": now.minute,
+                "date": now.strftime("%Y-%m-%d"),
+                "time": now.strftime("%H:%M:%S"),
+            })
+
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -116,10 +164,23 @@ class SmartHomeHandler(BaseHTTPRequestHandler):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Mock smart-home server")
+    parser.add_argument("--fake-time", action="store_true",
+                        help="Simulate time at 60× speed (1 real min = 1 fake hour, starts at midnight)")
+    args = parser.parse_args()
+
+    if args.fake_time:
+        clock = FakeClock()
+        print("⏩  Fake-time mode: 1 real minute = 1 simulated hour (starting at midnight)")
+    else:
+        clock = RealClock()
+        print("🕐  Real-time mode")
+
     HOST, PORT = "127.0.0.1", 8099
     server = HTTPServer((HOST, PORT), SmartHomeHandler)
     print(f"Mock smart-home server running on http://{HOST}:{PORT}")
     print("Endpoints:")
+    print("  GET  /time                                – current time")
     print("  GET  /thermostat                          – all thermostat state")
     print("  GET  /thermostat/living_room/current_temp  – living room current temp")
     print("  GET  /thermostat/bedroom/current_temp      – bedroom current temp")

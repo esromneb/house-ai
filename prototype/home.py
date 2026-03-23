@@ -2,12 +2,16 @@
 
 Uses LangChain's create_agent (LangGraph-based) with a shell/curl tool so the
 LLM can actually hit the mock smart-home server (prototype/mock_server.py).
+
+The GETs are done in Python so the LLM's only job is to issue POSTs.
 """
 
 import subprocess
+import json
 import time
 import os
 import warnings
+import urllib.request
 
 warnings.filterwarnings("ignore")
 
@@ -16,15 +20,24 @@ from langchain.agents import create_agent
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 
+BASE_URL = "http://127.0.0.1:8099"
 
-# ── curl tool ────────────────────────────────────────────────────────────────
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def http_get(path: str) -> dict:
+    """Quick GET against the mock server, returns parsed JSON."""
+    with urllib.request.urlopen(f"{BASE_URL}{path}") as resp:
+        return json.loads(resp.read())
+
+
+# ── curl tool (for the LLM to POST) ─────────────────────────────────────────
 
 @tool
 def curl(command: str) -> str:
-    """Run a curl shell command to make HTTP GET or POST requests against the smart-home server.
-    Examples:
-      GET:  curl http://127.0.0.1:8099/thermostat
-      POST: curl -X POST http://127.0.0.1:8099/thermostat/living_room/set_temp -H 'Content-Type: application/json' -d '{"set_temp": 72}'
+    """Run a curl shell command to make HTTP POST requests against the smart-home server.
+    Example:
+      curl -X POST http://127.0.0.1:8099/thermostat/living_room/set_temp -H 'Content-Type: application/json' -d '{"set_temp": 72}'
     """
     # LLMs sometimes pass just the URL — prepend curl if needed
     cmd = command.strip()
@@ -35,6 +48,16 @@ def curl(command: str) -> str:
         return result
     except subprocess.CalledProcessError as e:
         return f"ERROR (exit {e.returncode}): {e.output}"
+
+
+# ── target schedule ──────────────────────────────────────────────────────────
+
+SCHEDULE = """TARGET VALUES BY TIME OF DAY (winter schedule):
+  Time Period          | Living Room | Bedroom | Water Heater
+  Night  (10 PM – 6 AM) |   62°F      |  60°F   |   110°F
+  Morning (6 AM – 9 AM) |   72°F      |  70°F   |   125°F
+  Day    (9 AM – 5 PM)  |   68°F      |  66°F   |   120°F
+  Evening (5 PM – 10 PM)|   72°F      |  70°F   |   125°F"""
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -48,56 +71,23 @@ if __name__ == "__main__":
 
     llm = ChatOllama(model=model, base_url=OLLAMA_BASE_URL, temperature=0)
 
-    system_prompt = """You are an AI agent responsible for controlling the heating and hot-water systems of my house.
-You have a tool called "curl" that lets you run curl commands against a local HTTP server at http://127.0.0.1:8099.
+    system_prompt = f"""You are an AI agent that controls a home's thermostat and water heater.
+You have a tool called "curl" to make HTTP POST requests to http://127.0.0.1:8099.
 
-============================
-SKILL: Thermostat Control
-============================
-The house has two rooms with independent thermostats: "living_room" and "bedroom".
+{SCHEDULE}
 
-Reading current temperatures (GET):
-  curl http://127.0.0.1:8099/thermostat/living_room/current_temp
-  curl http://127.0.0.1:8099/thermostat/bedroom/current_temp
+RULES:
+- I will tell you the current time and current set-points.
+- Compare each set-point to the target for the current time period.
+- For EACH set-point that does not match: you MUST call the curl tool with a POST to change it.
+- If all set-points already match: respond with "No changes needed."
+- Do NOT just describe what you would do. Actually call the curl tool.
 
-Reading the set-point / target temperature (GET):
-  curl http://127.0.0.1:8099/thermostat/living_room/set_temp
-  curl http://127.0.0.1:8099/thermostat/bedroom/set_temp
-
-Reading all thermostat state at once (GET):
-  curl http://127.0.0.1:8099/thermostat
-
-Changing a room's set-point (POST):
-  curl -X POST http://127.0.0.1:8099/thermostat/living_room/set_temp -H 'Content-Type: application/json' -d '{"set_temp": 72}'
-  curl -X POST http://127.0.0.1:8099/thermostat/bedroom/set_temp -H 'Content-Type: application/json' -d '{"set_temp": 68}'
-
-All temperatures are in degrees Fahrenheit.
-
-============================
-SKILL: Water Heater Control
-============================
-The house has one water heater.
-
-Reading the current water temperature (GET):
-  curl http://127.0.0.1:8099/water_heater/current_temp
-
-Reading the water heater set-point (GET):
-  curl http://127.0.0.1:8099/water_heater/set_temp
-
-Reading all water heater state at once (GET):
-  curl http://127.0.0.1:8099/water_heater
-
-Changing the water heater set-point (POST):
-  curl -X POST http://127.0.0.1:8099/water_heater/set_temp -H 'Content-Type: application/json' -d '{"set_temp": 125}'
-
-Water temperature is in degrees Fahrenheit.
+POST commands:
+  Living room:  curl -X POST http://127.0.0.1:8099/thermostat/living_room/set_temp -H 'Content-Type: application/json' -d '{{"set_temp": <value>}}'
+  Bedroom:      curl -X POST http://127.0.0.1:8099/thermostat/bedroom/set_temp -H 'Content-Type: application/json' -d '{{"set_temp": <value>}}'
+  Water heater: curl -X POST http://127.0.0.1:8099/water_heater/set_temp -H 'Content-Type: application/json' -d '{{"set_temp": <value>}}'
 """
-
-    user_goal = """Optimize my house for winter usage.
-First, read the current state of the thermostat and water heater.
-Then, raise room temperatures to comfortable winter levels and ensure the water heater
-is set to an efficient but safe temperature for cold-weather use.
-Use the curl tool to make real HTTP requests. Do not just describe what you would do — actually do it."""
 
     agent = create_agent(
         llm,
@@ -105,28 +95,71 @@ Use the curl tool to make real HTTP requests. Do not just describe what you woul
         system_prompt=system_prompt,
     )
 
-    start_time = time.time()
+    LOOP_DELAY = 5  # seconds between agent iterations
+    iteration = 0
 
-    # Stream events so we can see the agent's tool calls as they happen
-    final_message = None
-    for event in agent.stream(
-        {"messages": [HumanMessage(content=user_goal)]},
-        stream_mode="updates",
-    ):
-        for node_name, node_output in event.items():
-            if "messages" in node_output:
-                for msg in node_output["messages"]:
-                    print(f"[{node_name}] {msg.type}: {msg.content[:200] if msg.content else '(tool call)'}")
-                    if hasattr(msg, "tool_calls") and msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            print(f"  -> tool_call: {tc['name']}({tc['args']})")
-                    final_message = msg
+    print("Starting agent loop (Ctrl+C to stop)...")
+    print(f"Polling every {LOOP_DELAY}s\n")
 
-    elapsed = time.time() - start_time
+    try:
+        while True:
+            iteration += 1
+            print(f"\n{'=' * 60}")
+            print(f"ITERATION {iteration}")
+            print(f"{'=' * 60}")
 
-    print("\n" + "=" * 60)
-    print("AGENT FINAL ANSWER:")
-    print("=" * 60)
-    if final_message and final_message.content:
-        print(final_message.content)
-    print(f"\nTotal run time: {elapsed:.2f} seconds")
+            # ── 1. Read state ourselves (GETs) ──────────────────────────
+            try:
+                time_data = http_get("/time")
+                thermo_data = http_get("/thermostat")
+                water_data = http_get("/water_heater")
+            except Exception as e:
+                print(f"  ERROR reading state: {e}")
+                time.sleep(LOOP_DELAY)
+                continue
+
+            current_time = time_data["time"]
+            hour = time_data["hour"]
+            print(f"  Time: {current_time}  (hour={hour})")
+            print(f"  Thermostat: living_room set={thermo_data['living_room']['set_temp']}, bedroom set={thermo_data['bedroom']['set_temp']}")
+            print(f"  Water heater: set={water_data['set_temp']}")
+
+            # ── 2. Build user message with current state ────────────────
+            user_msg = f"""Current time: {time_data['time']} (hour {hour})
+Current set-points:
+  - Living room: {thermo_data['living_room']['set_temp']}°F
+  - Bedroom: {thermo_data['bedroom']['set_temp']}°F
+  - Water heater: {water_data['set_temp']}°F
+
+Look up the target values for hour {hour} in the winter schedule.
+If any set-point differs from the target, call curl to POST the correct value NOW.
+Do not explain first — just make the curl calls, then summarize what you did."""
+
+            # ── 3. Run agent (expecting POSTs only) ─────────────────────
+            start_time = time.time()
+            final_message = None
+            for event in agent.stream(
+                {"messages": [HumanMessage(content=user_msg)]},
+                stream_mode="updates",
+            ):
+                for node_name, node_output in event.items():
+                    if "messages" in node_output:
+                        for msg in node_output["messages"]:
+                            print(f"  [{node_name}] {msg.type}: {msg.content[:300] if msg.content else '(tool call)'}")
+                            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                                for tc in msg.tool_calls:
+                                    print(f"    -> tool_call: {tc['name']}({tc['args']})")
+                            final_message = msg
+
+            elapsed = time.time() - start_time
+
+            print(f"\n  AGENT ANSWER:")
+            if final_message and final_message.content:
+                for line in final_message.content.strip().splitlines():
+                    print(f"    {line}")
+            print(f"  ({elapsed:.2f}s)")
+
+            time.sleep(LOOP_DELAY)
+
+    except KeyboardInterrupt:
+        print(f"\n\nStopped after {iteration} iterations.")
